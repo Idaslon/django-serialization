@@ -1,3 +1,4 @@
+from builtins import print
 from collections import Iterable
 from itertools import chain
 
@@ -10,24 +11,50 @@ class SerializerMeta(type):
         meta = attrs.pop('Meta', None)
         model = getattr(meta, 'model', None)
         fields = getattr(meta, 'fields', None)
-        related_to = getattr(meta, 'related_to', None)
 
-        serializer_related = {}
-
-        if related_to:
-            serializer_related = mcs._get_serializer_related(
-                list(related_to.keys()),
-                list(related_to.values())
-            )
+        foo = {}
+        if model and fields:
+            foo = mcs._get_foo(model, fields, attrs)
 
         setattr(new_class, 'model', model)
         setattr(new_class, 'fields', fields)
-        setattr(new_class, 'serializer_related', serializer_related)
+        setattr(new_class, 'foo', foo)
 
         return new_class
 
     @classmethod
-    def _get_serializer_related(mcs, fields, values):
+    def _get_foo(mcs, model, fields, attrs):
+        foo = {}
+        for field in fields:
+            representation_name = f'representation_{field}'
+            representation_func = attrs.pop(representation_name, None)
+
+            serializer_related = attrs.pop(field, None)
+
+            foo[field] = {
+                'model_field': mcs._get_model_field(model, field),
+                'representation': representation_func,
+                'serializer': {
+                    'class': serializer_related,
+                    'instance': None
+                }
+            }
+
+        return foo
+
+    @classmethod
+    def _get_model_field(mcs, model, field_name):
+        model_meta = model._meta
+        model_fields = list(model_meta.concrete_fields) + list(model_meta.private_fields)   # EveryTime
+
+        for field in model_fields:
+            if field.name == field_name:
+                return field
+
+        raise Exception(f'{field_name} does not reference a field of {model}')
+
+    @classmethod
+    def _get_serializer_fields(mcs, fields, values):
         serializer_related = {}
 
         for i in range(len(fields)):
@@ -36,6 +63,16 @@ class SerializerMeta(type):
                 'instance': None
             }
         return serializer_related
+
+    '''
+    field   => 
+        -> model_field
+        -> representation_func
+
+    field   => serializer_related
+        >> class
+        >> instance
+    '''
 
 
 MODEL = 'model'
@@ -47,9 +84,6 @@ class Serializer(metaclass=SerializerMeta):
     def __init__(self, initial_data=None, related_to=None):
         self.data = self.get_iterable_initial_data(initial_data)
         self.model_fields = self.get_model_fields()
-
-        if related_to:
-            self._set_related(related_to)
 
     def get_iterable_initial_data(self, initial_data) -> Iterable:
         if isinstance(initial_data, Iterable):
@@ -66,13 +100,9 @@ class Serializer(metaclass=SerializerMeta):
 
         return model_fields
 
-    def _set_related(self, related_to):
-        for field, instance in related_to.items():
-            self.serializer_related[field]['instance'] = instance
-
     def serialize(self, mode):
         function_name = f'{mode}_serialization'
-        if hasattr(self, function_name):
+        if hasattr(self, function_name):    #########
             return getattr(self, function_name)()
 
         raise Exception('Invalid serialization mode')
@@ -91,24 +121,28 @@ class Serializer(metaclass=SerializerMeta):
     def to_dict(self, instance_model):
         dict_model = {}
 
-        for field in self.model_fields:
-            field_name = field.name
+        for field in self.fields:
+            value_str = self.foo[field]['model_field'].value_from_object(instance_model)
 
-            if field_name in self.fields:
-                value_str = str(field.value_from_object(instance_model))
-                dict_model[field_name] = value_str
+            custom_representation = self.foo[field]['representation']
+            if custom_representation:
+                value_str = custom_representation(self, value_str)
+
+            dict_model[field] = value_str
 
         return dict_model
 
     def get_field_values(self, instance_model):
         field_values = []
 
-        for field in self.model_fields:
-            field_name = field.name
+        for field in self.fields:
+            value_str = self.foo[field]['model_field'].value_from_object(instance_model)
 
-            if field_name in self.fields:
-                value_str = str(field.value_from_object(instance_model))
-                field_values.append(value_str)
+            custom_representation = self.foo[field]['representation']
+            if custom_representation:
+                value_str = custom_representation(self, value_str)
+
+            field_values.append(value_str)
 
         return field_values
 
@@ -133,7 +167,20 @@ class Serializer(metaclass=SerializerMeta):
         if obj_fields != self.fields:
             raise Exception("Invalid Data, Keys must be the model fields")
 
-        self.model.objects.create(**obj_data)
+        data_to_create = {}
+
+        for field in self.fields:
+            serializer_related = self.foo[field]['serializer']
+            if serializer_related['class']:
+                data_to_create[field] = self.create_instance(serializer_related['class'].model, obj_data[field])
+            else:
+                data_to_create[field] = obj_data[field]
+
+        return self.create_instance(self.model, data_to_create)
+
+    @staticmethod
+    def create_instance(model, obj_data):
+        return model.objects.create(**obj_data)
 
     def create_multiple_instances(self, obj_data: list):
         for obj in obj_data:
@@ -164,18 +211,17 @@ class Serializer(metaclass=SerializerMeta):
 
     def form_data_and_create(self, fields_model, data):
         data_to_create = {}
+        fields_model_size = len(fields_model)
+
         for specific_obj in data:
 
-            for i in range(len(fields_model)):
+            for i in range(fields_model_size):
                 data_to_create[fields_model[i]] = specific_obj[i]
 
             self.model.objects.create(**data_to_create)
 
     def get_model_name(self) -> str:
         return self.model.__name__
-
-    def get_objects_count(self) -> int:
-        return len(self.data)
 
     def remove_objects(self, objs_to_remove):
         self.data = self.data.exclude(id__in=objs_to_remove)
